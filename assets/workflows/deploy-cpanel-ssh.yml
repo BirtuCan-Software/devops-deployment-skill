@@ -1,0 +1,251 @@
+name: Continuous Deployment to cPanel (SSH)
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+  workflow_dispatch:
+
+concurrency:
+  group: "deploy-${{ github.ref_name }}"
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy:
+    name: Build & Deploy to cPanel via SSH
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+
+    steps:
+      - name: ⏱️ Record Start Time
+        id: timer
+        run: echo "start_time=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: "🔔 Telegram: Notify Deployment Started"
+        id: tg_start
+        if: env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -f "./scripts/telegram-notify.sh" ]; then
+            chmod +x ./scripts/telegram-notify.sh
+            ./scripts/telegram-notify.sh start
+          else
+            # Zero-clutter inline fallback
+            BRANCH="${GITHUB_REF_NAME:-main}"
+            ENV_NAME="${GITHUB_ENVIRONMENT:-$BRANCH}"
+            ACTOR="${GITHUB_TRIGGERING_ACTOR:-${GITHUB_ACTOR:-developer}}"
+            COMMIT_HASH="${GITHUB_SHA:0:7}"
+            RAW_MSG="${COMMIT_MESSAGE:-$(git log -1 --pretty=format:'%s' 2>/dev/null || echo 'Manual Trigger')}"
+            COMMIT_MSG=$(printf '%s' "$RAW_MSG" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            TEXT="🚀 <b>Deployment Started</b>"$'\n\n'"<blockquote>📦 <b>Repository:</b> <code>${GITHUB_REPOSITORY}</code>"$'\n'"🌿 <b>Branch:</b> <code>${BRANCH}</code> (${ENV_NAME})"$'\n'"👤 <b>Triggered By:</b> ${ACTOR}"$'\n'"📝 <b>Commit:</b> <code>${COMMIT_HASH}</code> — ${COMMIT_MSG}</blockquote>"$'\n\n'"🔗 <a href=\"${RUN_URL}\"><b>View Actions Run #${GITHUB_RUN_NUMBER} →</b></a>"
+            EXTRA=()
+            [ -n "$TELEGRAM_MESSAGE_THREAD_ID" ] && [ "$TELEGRAM_MESSAGE_THREAD_ID" != "0" ] && EXTRA+=(--data-urlencode "message_thread_id=${TELEGRAM_MESSAGE_THREAD_ID}")
+            RESP=$(curl -s -S -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "parse_mode=HTML" \
+              --data-urlencode "disable_web_page_preview=true" \
+              "${EXTRA[@]}" \
+              --data-urlencode "text=${TEXT}" || true)
+            MSG_ID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | cut -d: -f2 | head -n 1)
+            [ -n "$MSG_ID" ] && echo "message_id=$MSG_ID" >> "$GITHUB_OUTPUT" || true
+          fi
+
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: ⚙️ Setup Node.js Runtime & Cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm' # Change to pnpm or yarn based on stack detection
+
+      - name: 📦 Install Dependencies
+        run: npm ci
+
+      - name: "🛡️ Quality Gate: Linting & Tests"
+        run: |
+          npm run lint --if-present
+          npm test --if-present
+
+      - name: 🏗️ Build Production Artifacts
+        run: npm run build
+
+      - name: 📦 Package Release Archive
+        id: package
+        run: |
+          ARCHIVE_NAME="release-${{ github.sha }}.zip"
+          echo "archive_name=$ARCHIVE_NAME" >> "$GITHUB_OUTPUT"
+          
+          # If backend or fullstack: package needed files, excluding source clutter and venvs
+          # If static frontend: zip the build directory (e.g. dist/* or build/*)
+          if [ -d "dist" ]; then
+            # Copy SPA .htaccess if serving a client-side SPA
+            if [ -f "./assets/configs/htaccess-spa.txt" ] && [ ! -f "dist/.htaccess" ]; then
+              cp ./assets/configs/htaccess-spa.txt dist/.htaccess
+            fi
+            cd dist && zip -q -r "../$ARCHIVE_NAME" . && cd ..
+          else
+            zip -q -r "$ARCHIVE_NAME" . \
+              -x "*.git*" "node_modules/*" ".venv/*" "tests/*" ".github/*" "*.md"
+          fi
+
+      - name: 🔐 Configure & Normalize SSH Private Key
+        id: ssh_key
+        env:
+          CPANEL_SSH_KEY: ${{ secrets.CPANEL_SSH_KEY }}
+          CPANEL_SSH_PASSPHRASE: ${{ secrets.CPANEL_SSH_PASSPHRASE }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          KEY_PATH="$HOME/.ssh/id_rsa_deploy"
+          
+          printf '%s\n' "$CPANEL_SSH_KEY" | tr -d '\r' > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          
+          if [ -n "$CPANEL_SSH_PASSPHRASE" ]; then
+            ssh-keygen -p -P "$CPANEL_SSH_PASSPHRASE" -N "" -f "$KEY_PATH" 2>/dev/null || true
+          fi
+          
+          echo "key_path=$KEY_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: 🔍 Probe Active SSH Port & Populate Known Hosts
+        id: ssh_probe
+        env:
+          HOST: ${{ secrets.CPANEL_SSH_HOST }}
+          PREFERRED_PORT: ${{ secrets.CPANEL_SSH_PORT }}
+        run: |
+          touch ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          
+          SELECTED_PORT=""
+          CANDIDATES=()
+          [ -n "$PREFERRED_PORT" ] && CANDIDATES+=("$PREFERRED_PORT")
+          for p in 22 1219 2222; do
+            [ "$p" != "$PREFERRED_PORT" ] && CANDIDATES+=("$p")
+          done
+          
+          for port in "${CANDIDATES[@]}"; do
+            KEY=$(ssh-keyscan -p "$port" -T 3 "$HOST" 2>/dev/null || true)
+            if [ -n "$KEY" ]; then
+              echo "$KEY" >> ~/.ssh/known_hosts
+              SELECTED_PORT="$port"
+              break
+            fi
+          done
+          
+          if [ -z "$SELECTED_PORT" ]; then
+            SELECTED_PORT="${PREFERRED_PORT:-22}"
+            ssh-keyscan -p "$SELECTED_PORT" "$HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          fi
+          
+          echo "port=$SELECTED_PORT" >> "$GITHUB_OUTPUT"
+
+      - name: 🚀 Transfer Release Archive via SCP
+        env:
+          KEY_PATH: ${{ steps.ssh_key.outputs.key_path }}
+          PORT: ${{ steps.ssh_probe.outputs.port }}
+          USER: ${{ vars.CPANEL_USER }}
+          HOST: ${{ secrets.CPANEL_SSH_HOST }}
+          APP_DIR: ${{ vars.CPANEL_APP_DIR }}
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+        run: |
+          ssh -i "$KEY_PATH" -p "$PORT" -o BatchMode=yes "$USER@$HOST" "mkdir -p ~/$APP_DIR/incoming"
+          scp -i "$KEY_PATH" -P "$PORT" -o BatchMode=yes "$ARCHIVE_NAME" "$USER@$HOST:~/$APP_DIR/incoming/"
+
+      - name: ⚙️ Execute Remote Deployment on cPanel
+        env:
+          KEY_PATH: ${{ steps.ssh_key.outputs.key_path }}
+          PORT: ${{ steps.ssh_probe.outputs.port }}
+          USER: ${{ vars.CPANEL_USER }}
+          HOST: ${{ secrets.CPANEL_SSH_HOST }}
+          APP_DIR: ${{ vars.CPANEL_APP_DIR }}
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+          RELEASE_ID: ${{ github.sha }}
+        run: |
+          # If companion deployment script exists in repo, upload and execute it
+          if [ -f "./scripts/cpanel-deploy-remote.sh" ]; then
+            scp -i "$KEY_PATH" -P "$PORT" -o BatchMode=yes ./scripts/cpanel-deploy-remote.sh "$USER@$HOST:~/$APP_DIR/deploy-remote.sh"
+            ssh -i "$KEY_PATH" -p "$PORT" -o BatchMode=yes "$USER@$HOST" "chmod 700 ~/$APP_DIR/deploy-remote.sh && ~/$APP_DIR/deploy-remote.sh '$APP_DIR' '$ARCHIVE_NAME' '$RELEASE_ID' && rm -f ~/$APP_DIR/deploy-remote.sh"
+          else
+            # Idempotent inline extraction fallback (Zero-Clutter Mode)
+            ssh -i "$KEY_PATH" -p "$PORT" -o BatchMode=yes "$USER@$HOST" "
+              set -e
+              TARGET=\$HOME/$APP_DIR
+              mkdir -p \$TARGET/tmp \$TARGET/shared
+              [ -f \$TARGET/.env ] && cp -p \$TARGET/.env \$TARGET/shared/.env || true
+              if command -v unzip >/dev/null 2>&1; then
+                unzip -q -o \$TARGET/incoming/$ARCHIVE_NAME -d \$TARGET/
+              elif command -v python3 >/dev/null 2>&1; then
+                python3 -m zipfile -e \$TARGET/incoming/$ARCHIVE_NAME \$TARGET/
+              fi
+              [ -f \$TARGET/shared/.env ] && cp -p \$TARGET/shared/.env \$TARGET/.env || true
+              find \$TARGET -type d -exec chmod 755 {} + 2>/dev/null || true
+              find \$TARGET -type f -exec chmod 644 {} + 2>/dev/null || true
+              touch \$TARGET/tmp/restart.txt
+              rm -f \$TARGET/incoming/$ARCHIVE_NAME
+            "
+          fi
+
+      - name: "🔔 Telegram: Notify Deployment Finished"
+        if: always() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          CPANEL_FRONTEND_DOMAIN: ${{ vars.CPANEL_FRONTEND_DOMAIN }}
+          START_MSG_ID: ${{ steps.tg_start.outputs.message_id }}
+          START_TIME: ${{ steps.timer.outputs.start_time }}
+          JOB_STATUS: ${{ job.status }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -f "./scripts/telegram-notify.sh" ]; then
+            chmod +x ./scripts/telegram-notify.sh
+            ./scripts/telegram-notify.sh finish "$JOB_STATUS" "$START_MSG_ID" "$START_TIME"
+          else
+            # Zero-clutter inline fallback
+            if [ -n "$START_MSG_ID" ]; then
+              curl -s -S -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteMessage" \
+                --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+                --data-urlencode "message_id=${START_MSG_ID}" >/dev/null 2>&1 || true
+            fi
+            ELAPSED=0
+            [ -n "$START_TIME" ] && ELAPSED=$(( $(date +%s) - START_TIME ))
+            DURATION="$(( ELAPSED / 60 ))m $(( ELAPSED % 60 ))s"
+            case "$JOB_STATUS" in
+              success) ICON="✅"; TITLE="Deployment Successful" ;;
+              cancelled) ICON="⚠️"; TITLE="Deployment Cancelled" ;;
+              *) ICON="❌"; TITLE="Deployment Failed" ;;
+            esac
+            BRANCH="${GITHUB_REF_NAME:-main}"
+            ENV_NAME="${GITHUB_ENVIRONMENT:-$BRANCH}"
+            ACTOR="${GITHUB_TRIGGERING_ACTOR:-${GITHUB_ACTOR:-developer}}"
+            COMMIT_HASH="${GITHUB_SHA:0:7}"
+            RAW_MSG="${COMMIT_MESSAGE:-$(git log -1 --pretty=format:'%s' 2>/dev/null || echo 'Manual Trigger')}"
+            COMMIT_MSG=$(printf '%s' "$RAW_MSG" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            TEXT="${ICON} <b>${TITLE}</b>"$'\n\n'"<blockquote>📦 <b>Repository:</b> <code>${GITHUB_REPOSITORY}</code>"$'\n'"🌿 <b>Branch:</b> <code>${BRANCH}</code> (${ENV_NAME})"$'\n'"👤 <b>Triggered By:</b> ${ACTOR}"$'\n'"📝 <b>Commit:</b> <code>${COMMIT_HASH}</code> — ${COMMIT_MSG}"$'\n'"⏱️ <b>Duration:</b> ${DURATION}</blockquote>"
+            if [ -n "$CPANEL_FRONTEND_DOMAIN" ] && [ "$JOB_STATUS" = "success" ]; then
+              TEXT+=$'\n\n'"🌐 <a href=\"${CPANEL_FRONTEND_DOMAIN}\"><b>Visit Deployed Site →</b></a>"
+            fi
+            TEXT+=$'\n\n'"🔗 <a href=\"${RUN_URL}\"><b>View Actions Run #${GITHUB_RUN_NUMBER} →</b></a>"
+            EXTRA=()
+            [ -n "$TELEGRAM_MESSAGE_THREAD_ID" ] && [ "$TELEGRAM_MESSAGE_THREAD_ID" != "0" ] && EXTRA+=(--data-urlencode "message_thread_id=${TELEGRAM_MESSAGE_THREAD_ID}")
+            curl -s -S -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "parse_mode=HTML" \
+              --data-urlencode "disable_web_page_preview=true" \
+              "${EXTRA[@]}" \
+              --data-urlencode "text=${TEXT}" || true
+          fi

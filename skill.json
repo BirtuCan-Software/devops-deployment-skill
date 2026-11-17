@@ -1,0 +1,30 @@
+{
+  "name": "devops-deployment",
+  "version": "1.1.0",
+  "description": "Comprehensive continuous deployment automation for GitHub Actions targeting cPanel (SSH and FTPS) and Vercel, with automated repository inspection, confirmation gates, quality gates, atomic rollbacks, and Telegram notification alerts.",
+  "author": "Senior AI Agent Architect & Principal DevOps Engineer",
+  "repository": "https://github.com/BirtuCan-Software/devops-deployment-skill",
+  "license": "Apache-2.0",
+  "specVersion": "1.0",
+  "entrypoint": "SKILL.md",
+  "discoveryPaths": {
+    "agentskills": ".agentskills/devops-deployment",
+    "antigravity": ".gemini/skills/devops-deployment",
+    "cursor": ".cursor/skills/devops-deployment",
+    "claude": ".claude/skills/devops-deployment",
+    "windsurf": ".windsurf/skills/devops-deployment",
+    "copilot": ".github/skills/devops-deployment"
+  },
+  "compatibility": {
+    "agents": [
+      "Antigravity",
+      "Cursor",
+      "Claude Code",
+      "Windsurf",
+      "GitHub Copilot",
+      "Vercel Skills CLI"
+    ],
+    "platforms": ["linux", "darwin", "win32"],
+    "python": ">=3.8"
+  }
+}

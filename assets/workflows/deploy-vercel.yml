@@ -1,0 +1,169 @@
+name: Continuous Deployment to Vercel
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+  workflow_dispatch:
+
+concurrency:
+  group: "vercel-${{ github.ref_name }}"
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  deployments: write
+  pull-requests: write
+
+jobs:
+  deploy:
+    name: Build & Deploy to Vercel
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+
+    steps:
+      - name: ⏱️ Record Start Time
+        id: timer
+        run: echo "start_time=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: "🔔 Telegram: Notify Deployment Started"
+        id: tg_start
+        if: env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -f "./scripts/telegram-notify.sh" ]; then
+            chmod +x ./scripts/telegram-notify.sh
+            ./scripts/telegram-notify.sh start
+          else
+            # Zero-clutter inline fallback
+            BRANCH="${GITHUB_REF_NAME:-main}"
+            ENV_NAME="${GITHUB_ENVIRONMENT:-$BRANCH}"
+            ACTOR="${GITHUB_TRIGGERING_ACTOR:-${GITHUB_ACTOR:-developer}}"
+            COMMIT_HASH="${GITHUB_SHA:0:7}"
+            RAW_MSG="${COMMIT_MESSAGE:-$(git log -1 --pretty=format:'%s' 2>/dev/null || echo 'Manual Trigger')}"
+            COMMIT_MSG=$(printf '%s' "$RAW_MSG" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            TEXT="🚀 <b>Deployment Started</b>"$'\n\n'"<blockquote>📦 <b>Repository:</b> <code>${GITHUB_REPOSITORY}</code>"$'\n'"🌿 <b>Branch:</b> <code>${BRANCH}</code> (${ENV_NAME})"$'\n'"👤 <b>Triggered By:</b> ${ACTOR}"$'\n'"📝 <b>Commit:</b> <code>${COMMIT_HASH}</code> — ${COMMIT_MSG}</blockquote>"$'\n\n'"🔗 <a href=\"${RUN_URL}\"><b>View Actions Run #${GITHUB_RUN_NUMBER} →</b></a>"
+            EXTRA=()
+            [ -n "$TELEGRAM_MESSAGE_THREAD_ID" ] && [ "$TELEGRAM_MESSAGE_THREAD_ID" != "0" ] && EXTRA+=(--data-urlencode "message_thread_id=${TELEGRAM_MESSAGE_THREAD_ID}")
+            RESP=$(curl -s -S -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "parse_mode=HTML" \
+              --data-urlencode "disable_web_page_preview=true" \
+              "${EXTRA[@]}" \
+              --data-urlencode "text=${TEXT}" || true)
+            MSG_ID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | cut -d: -f2 | head -n 1)
+            [ -n "$MSG_ID" ] && echo "message_id=$MSG_ID" >> "$GITHUB_OUTPUT" || true
+          fi
+
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: ⚙️ Setup Node.js Runtime & Cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 📦 Install Dependencies
+        run: npm ci
+
+      - name: "🛡️ Quality Gate: Linting & Tests"
+        run: |
+          npm run lint --if-present
+          npm test --if-present
+
+      - name: 🛠️ Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: 📥 Pull Vercel Environment Information
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          vercel pull --yes \
+            --environment=${{ github.ref_name == 'main' && 'production' || 'preview' }} \
+            --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: 🏗️ Build Project Artifacts via Vercel CLI
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          vercel build ${{ github.ref_name == 'main' && '--prod' || '' }} \
+            --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: 🚀 Deploy Prebuilt Assets to Vercel
+        id: vercel_deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          DEPLOY_URL=$(vercel deploy --prebuilt ${{ github.ref_name == 'main' && '--prod' || '' }} --token=${{ secrets.VERCEL_TOKEN }})
+          echo "deploy_url=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
+          
+          echo "### 🚀 Vercel Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Target Environment:** \`${{ github.ref_name == 'main' && 'Production' || 'Preview' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Deployment URL:** [$DEPLOY_URL]($DEPLOY_URL)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "🔔 Telegram: Notify Deployment Finished"
+        if: always() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          DEPLOY_URL: ${{ steps.vercel_deploy.outputs.deploy_url }}
+          START_MSG_ID: ${{ steps.tg_start.outputs.message_id }}
+          START_TIME: ${{ steps.timer.outputs.start_time }}
+          JOB_STATUS: ${{ job.status }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -f "./scripts/telegram-notify.sh" ]; then
+            chmod +x ./scripts/telegram-notify.sh
+            ./scripts/telegram-notify.sh finish "$JOB_STATUS" "$START_MSG_ID" "$START_TIME"
+          else
+            # Zero-clutter inline fallback
+            if [ -n "$START_MSG_ID" ]; then
+              curl -s -S -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteMessage" \
+                --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+                --data-urlencode "message_id=${START_MSG_ID}" >/dev/null 2>&1 || true
+            fi
+            ELAPSED=0
+            [ -n "$START_TIME" ] && ELAPSED=$(( $(date +%s) - START_TIME ))
+            DURATION="$(( ELAPSED / 60 ))m $(( ELAPSED % 60 ))s"
+            case "$JOB_STATUS" in
+              success) ICON="✅"; TITLE="Deployment Successful" ;;
+              cancelled) ICON="⚠️"; TITLE="Deployment Cancelled" ;;
+              *) ICON="❌"; TITLE="Deployment Failed" ;;
+            esac
+            BRANCH="${GITHUB_REF_NAME:-main}"
+            ENV_NAME="${GITHUB_ENVIRONMENT:-$BRANCH}"
+            ACTOR="${GITHUB_TRIGGERING_ACTOR:-${GITHUB_ACTOR:-developer}}"
+            COMMIT_HASH="${GITHUB_SHA:0:7}"
+            RAW_MSG="${COMMIT_MESSAGE:-$(git log -1 --pretty=format:'%s' 2>/dev/null || echo 'Manual Trigger')}"
+            COMMIT_MSG=$(printf '%s' "$RAW_MSG" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            TEXT="${ICON} <b>${TITLE}</b>"$'\n\n'"<blockquote>📦 <b>Repository:</b> <code>${GITHUB_REPOSITORY}</code>"$'\n'"🌿 <b>Branch:</b> <code>${BRANCH}</code> (${ENV_NAME})"$'\n'"👤 <b>Triggered By:</b> ${ACTOR}"$'\n'"📝 <b>Commit:</b> <code>${COMMIT_HASH}</code> — ${COMMIT_MSG}"$'\n'"⏱️ <b>Duration:</b> ${DURATION}</blockquote>"
+            if [ -n "$DEPLOY_URL" ] && [ "$JOB_STATUS" = "success" ]; then
+              TEXT+=$'\n\n'"🌐 <a href=\"${DEPLOY_URL}\"><b>Visit Deployed Site →</b></a>"
+            fi
+            TEXT+=$'\n\n'"🔗 <a href=\"${RUN_URL}\"><b>View Actions Run #${GITHUB_RUN_NUMBER} →</b></a>"
+            EXTRA=()
+            [ -n "$TELEGRAM_MESSAGE_THREAD_ID" ] && [ "$TELEGRAM_MESSAGE_THREAD_ID" != "0" ] && EXTRA+=(--data-urlencode "message_thread_id=${TELEGRAM_MESSAGE_THREAD_ID}")
+            curl -s -S -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "parse_mode=HTML" \
+              --data-urlencode "disable_web_page_preview=true" \
+              "${EXTRA[@]}" \
+              --data-urlencode "text=${TEXT}" || true
+          fi

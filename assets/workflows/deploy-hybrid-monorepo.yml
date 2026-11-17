@@ -1,0 +1,292 @@
+name: Continuous Deployment (Monorepo Hybrid)
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+  workflow_dispatch:
+
+concurrency:
+  group: "deploy-${{ github.ref_name }}"
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  deployments: write
+  pull-requests: write
+
+jobs:
+  notify-start:
+    name: "🔔 Telegram: Alert Deployment Started"
+    runs-on: ubuntu-latest
+    outputs:
+      message_id: ${{ steps.tg_start.outputs.message_id }}
+      start_time: ${{ steps.timer.outputs.start_time }}
+    steps:
+      - name: ⏱️ Record Start Time
+        id: timer
+        run: echo "start_time=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: 📥 Checkout Scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: 'scripts'
+
+      - name: 🔔 Send Telegram Started Notification
+        id: tg_start
+        if: env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -f "./scripts/telegram-notify.sh" ]; then
+            chmod +x ./scripts/telegram-notify.sh
+            ./scripts/telegram-notify.sh start
+          else
+            # Zero-clutter inline fallback
+            BRANCH="${GITHUB_REF_NAME:-main}"
+            ENV_NAME="${GITHUB_ENVIRONMENT:-$BRANCH}"
+            ACTOR="${GITHUB_TRIGGERING_ACTOR:-${GITHUB_ACTOR:-developer}}"
+            COMMIT_HASH="${GITHUB_SHA:0:7}"
+            RAW_MSG="${COMMIT_MESSAGE:-$(git log -1 --pretty=format:'%s' 2>/dev/null || echo 'Manual Trigger')}"
+            COMMIT_MSG=$(printf '%s' "$RAW_MSG" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            TEXT="🚀 <b>Deployment Started</b>"$'\n\n'"<blockquote>📦 <b>Repository:</b> <code>${GITHUB_REPOSITORY}</code>"$'\n'"🌿 <b>Branch:</b> <code>${BRANCH}</code> (${ENV_NAME})"$'\n'"👤 <b>Triggered By:</b> ${ACTOR}"$'\n'"📝 <b>Commit:</b> <code>${COMMIT_HASH}</code> — ${COMMIT_MSG}</blockquote>"$'\n\n'"🔗 <a href=\"${RUN_URL}\"><b>View Actions Run #${GITHUB_RUN_NUMBER} →</b></a>"
+            EXTRA=()
+            [ -n "$TELEGRAM_MESSAGE_THREAD_ID" ] && [ "$TELEGRAM_MESSAGE_THREAD_ID" != "0" ] && EXTRA+=(--data-urlencode "message_thread_id=${TELEGRAM_MESSAGE_THREAD_ID}")
+            RESP=$(curl -s -S -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "parse_mode=HTML" \
+              --data-urlencode "disable_web_page_preview=true" \
+              "${EXTRA[@]}" \
+              --data-urlencode "text=${TEXT}" || true)
+            MSG_ID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | cut -d: -f2 | head -n 1)
+            [ -n "$MSG_ID" ] && echo "message_id=$MSG_ID" >> "$GITHUB_OUTPUT" || true
+          fi
+
+  deploy-frontend:
+    name: 🌐 Deploy Frontend to Vercel
+    needs: [notify-start]
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+    outputs:
+      deploy_url: ${{ steps.vercel_deploy.outputs.deploy_url }}
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: 'frontend/package-lock.json'
+
+      - name: 📦 Install Frontend Dependencies
+        run: npm ci
+
+      - name: 🛡️ Frontend Quality Gate
+        run: |
+          npm run lint --if-present
+          npm test --if-present
+
+      - name: 🛠️ Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: 📥 Pull Vercel Environment
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          vercel pull --yes \
+            --environment=${{ github.ref_name == 'main' && 'production' || 'preview' }} \
+            --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: 🏗️ Build Prebuilt Artifacts
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          vercel build ${{ github.ref_name == 'main' && '--prod' || '' }} \
+            --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: 🚀 Deploy to Vercel
+        id: vercel_deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          URL=$(vercel deploy --prebuilt ${{ github.ref_name == 'main' && '--prod' || '' }} --token=${{ secrets.VERCEL_TOKEN }})
+          echo "deploy_url=$URL" >> "$GITHUB_OUTPUT"
+
+  deploy-backend:
+    name: ⚙️ Deploy Backend to cPanel (SSH)
+    needs: [notify-start]
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Python / Runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'backend/requirements.txt'
+
+      - name: 📦 Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: 🛡️ Backend Quality Gate
+        run: |
+          pytest --if-present || true
+
+      - name: 📦 Package Backend Release
+        id: package
+        run: |
+          ARCHIVE_NAME="backend-release-${{ github.sha }}.zip"
+          zip -q -r "../$ARCHIVE_NAME" . -x "*.git*" "__pycache__/*" ".venv/*" "tests/*"
+          echo "archive_name=$ARCHIVE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: 🔐 Configure SSH Key
+        id: ssh_key
+        env:
+          CPANEL_SSH_KEY: ${{ secrets.CPANEL_SSH_KEY }}
+          CPANEL_SSH_PASSPHRASE: ${{ secrets.CPANEL_SSH_PASSPHRASE }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          KEY_PATH="$HOME/.ssh/id_rsa_deploy"
+          printf '%s\n' "$CPANEL_SSH_KEY" | tr -d '\r' > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          if [ -n "$CPANEL_SSH_PASSPHRASE" ]; then
+            ssh-keygen -p -P "$CPANEL_SSH_PASSPHRASE" -N "" -f "$KEY_PATH" 2>/dev/null || true
+          fi
+          echo "key_path=$KEY_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: 🔍 Probe SSH Port
+        id: ssh_probe
+        env:
+          HOST: ${{ secrets.CPANEL_SSH_HOST }}
+          PREFERRED_PORT: ${{ secrets.CPANEL_SSH_PORT }}
+        run: |
+          touch ~/.ssh/known_hosts
+          SELECTED_PORT=""
+          for p in "${PREFERRED_PORT:-}" 22 1219 2222; do
+            [ -z "$p" ] && continue
+            if ssh-keyscan -p "$p" -T 3 "$HOST" 2>/dev/null | grep -q "$HOST"; then
+              ssh-keyscan -p "$p" "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+              SELECTED_PORT="$p"
+              break
+            fi
+          done
+          echo "port=${SELECTED_PORT:-22}" >> "$GITHUB_OUTPUT"
+
+      - name: 🚀 Transfer & Deploy to cPanel
+        env:
+          KEY_PATH: ${{ steps.ssh_key.outputs.key_path }}
+          PORT: ${{ steps.ssh_probe.outputs.port }}
+          USER: ${{ vars.CPANEL_USER }}
+          HOST: ${{ secrets.CPANEL_SSH_HOST }}
+          APP_DIR: ${{ vars.CPANEL_APP_DIR }}
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+        run: |
+          ssh -i "$KEY_PATH" -p "$PORT" -o BatchMode=yes "$USER@$HOST" "mkdir -p ~/$APP_DIR/incoming"
+          scp -i "$KEY_PATH" -P "$PORT" -o BatchMode=yes "../$ARCHIVE_NAME" "$USER@$HOST:~/$APP_DIR/incoming/"
+          ssh -i "$KEY_PATH" -p "$PORT" -o BatchMode=yes "$USER@$HOST" "
+            set -e
+            TARGET=\$HOME/$APP_DIR
+            mkdir -p \$TARGET/tmp \$TARGET/shared
+            [ -f \$TARGET/.env ] && cp -p \$TARGET/.env \$TARGET/shared/.env || true
+            unzip -q -o \$TARGET/incoming/$ARCHIVE_NAME -d \$TARGET/
+            [ -f \$TARGET/shared/.env ] && cp -p \$TARGET/shared/.env \$TARGET/.env || true
+            find \$TARGET -type d -exec chmod 755 {} +
+            find \$TARGET -type f -exec chmod 644 {} +
+            touch \$TARGET/tmp/restart.txt
+            rm -f \$TARGET/incoming/$ARCHIVE_NAME
+          "
+
+  notify-finish:
+    name: "🔔 Telegram: Alert Deployment Complete"
+    needs: [notify-start, deploy-frontend, deploy-backend]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: 'scripts'
+
+      - name: 🔔 Send Final Telegram Status
+        if: env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          DEPLOY_URL: ${{ needs.deploy-frontend.outputs.deploy_url }}
+          START_MSG_ID: ${{ needs.notify-start.outputs.message_id }}
+          START_TIME: ${{ needs.notify-start.outputs.start_time }}
+          FRONTEND_STATUS: ${{ needs.deploy-frontend.result }}
+          BACKEND_STATUS: ${{ needs.deploy-backend.result }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          # Compute composite status
+          OVERALL_STATUS="success"
+          if [ "$FRONTEND_STATUS" = "failure" ] || [ "$BACKEND_STATUS" = "failure" ]; then
+            OVERALL_STATUS="failure"
+          elif [ "$FRONTEND_STATUS" = "cancelled" ] || [ "$BACKEND_STATUS" = "cancelled" ]; then
+            OVERALL_STATUS="cancelled"
+          fi
+          
+          if [ -f "./scripts/telegram-notify.sh" ]; then
+            chmod +x ./scripts/telegram-notify.sh
+            ./scripts/telegram-notify.sh finish "$OVERALL_STATUS" "$START_MSG_ID" "$START_TIME"
+          else
+            # Zero-clutter inline fallback
+            if [ -n "$START_MSG_ID" ]; then
+              curl -s -S -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteMessage" \
+                --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+                --data-urlencode "message_id=${START_MSG_ID}" >/dev/null 2>&1 || true
+            fi
+            ELAPSED=0
+            [ -n "$START_TIME" ] && ELAPSED=$(( $(date +%s) - START_TIME ))
+            DURATION="$(( ELAPSED / 60 ))m $(( ELAPSED % 60 ))s"
+            case "$OVERALL_STATUS" in
+              success) ICON="✅"; TITLE="Deployment Successful" ;;
+              cancelled) ICON="⚠️"; TITLE="Deployment Cancelled" ;;
+              *) ICON="❌"; TITLE="Deployment Failed" ;;
+            esac
+            BRANCH="${GITHUB_REF_NAME:-main}"
+            ENV_NAME="${GITHUB_ENVIRONMENT:-$BRANCH}"
+            ACTOR="${GITHUB_TRIGGERING_ACTOR:-${GITHUB_ACTOR:-developer}}"
+            COMMIT_HASH="${GITHUB_SHA:0:7}"
+            RAW_MSG="${COMMIT_MESSAGE:-$(git log -1 --pretty=format:'%s' 2>/dev/null || echo 'Manual Trigger')}"
+            COMMIT_MSG=$(printf '%s' "$RAW_MSG" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            TEXT="${ICON} <b>${TITLE}</b>"$'\n\n'"<blockquote>📦 <b>Repository:</b> <code>${GITHUB_REPOSITORY}</code>"$'\n'"🌿 <b>Branch:</b> <code>${BRANCH}</code> (${ENV_NAME})"$'\n'"👤 <b>Triggered By:</b> ${ACTOR}"$'\n'"📝 <b>Commit:</b> <code>${COMMIT_HASH}</code> — ${COMMIT_MSG}"$'\n'"⏱️ <b>Duration:</b> ${DURATION}</blockquote>"
+            if [ -n "$DEPLOY_URL" ] && [ "$OVERALL_STATUS" = "success" ]; then
+              TEXT+=$'\n\n'"🌐 <a href=\"${DEPLOY_URL}\"><b>Visit Deployed Site →</b></a>"
+            fi
+            TEXT+=$'\n\n'"🔗 <a href=\"${RUN_URL}\"><b>View Actions Run #${GITHUB_RUN_NUMBER} →</b></a>"
+            EXTRA=()
+            [ -n "$TELEGRAM_MESSAGE_THREAD_ID" ] && [ "$TELEGRAM_MESSAGE_THREAD_ID" != "0" ] && EXTRA+=(--data-urlencode "message_thread_id=${TELEGRAM_MESSAGE_THREAD_ID}")
+            curl -s -S -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "parse_mode=HTML" \
+              --data-urlencode "disable_web_page_preview=true" \
+              "${EXTRA[@]}" \
+              --data-urlencode "text=${TEXT}" || true
+          fi

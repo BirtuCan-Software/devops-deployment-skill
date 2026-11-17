@@ -1,0 +1,12 @@
+# Git ignore for Agent Skill repository
+.DS_Store
+Thumbs.db
+*.tmp
+*.log
+.vscode/
+.idea/
+__pycache__/
+*.py[cod]
+.test_sandbox/
+*.bak_*
+.skill-metadata.json
