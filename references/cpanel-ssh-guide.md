@@ -160,3 +160,30 @@ RewriteCond %{REQUEST_FILENAME} -d
 RewriteRule ^ - [L]
 RewriteRule ^ index.html [L]
 ```
+
+### D. Split Monorepos on cPanel (Vite SPA Subdomain + Django/FastAPI Passenger)
+
+When a monorepo deploys both a frontend SPA and a backend Python API to cPanel, they must be partitioned into two distinct filesystem targets:
+
+1. **Separation of Targets:**
+   - **Python Application Root (`$HOME/$CPANEL_APP_DIR`, e.g. `~/natranapi`):** Hosts the backend codebase, Python dependencies, database configuration, migrations, static assets, and `passenger_wsgi.py`.
+   - **Apache Subdomain Document Root (`$HOME/$CPANEL_FRONTEND_DIR`, e.g. `~/natran.koshomecafe.com`):** Hosts the built frontend SPA static assets (`index.html`, `assets/`, `.htaccess`).
+
+2. **Frontend Routing & Vite Base Configuration:**
+   - SPAs hosted on standalone subdomains (e.g. `natran.koshomecafe.com`) must build with `base: "/"` (not `"/static/"` or relative `./`).
+   - The subdomain document root must contain an Apache SPA rewrite `.htaccess` routing all non-file requests to `index.html`.
+   - A compatibility symlink (`ln -s . static`) is created inside the frontend document root to prevent asset 404s if legacy paths reference `/static/`.
+
+3. **cPanel CloudLinux/CageFS Virtualenv Discovery:**
+   - Standard cPanel CloudLinux "Setup Python App" places virtualenvs in:
+     ```
+     $HOME/virtualenv/<app_dir>/<python_version>/bin/activate
+     ```
+   - Discovering this virtualenv requires a search depth of at least **4** (not depth 2):
+     ```bash
+     VENV_ACTIVATE=$(find $HOME/virtualenv/$APP_DIR -maxdepth 4 -name activate 2>/dev/null | head -n 1 || true)
+     if [ -z "$VENV_ACTIVATE" ]; then
+       VENV_ACTIVATE=$(find $HOME/virtualenv -maxdepth 5 -name activate 2>/dev/null | grep -i "$APP_DIR" | head -n 1 || true)
+     fi
+     ```
+   - Once activated, run migrations (`python manage.py migrate --noinput`) and collectstatic, followed by recycling Passenger workers (`touch $HOME/$CPANEL_APP_DIR/tmp/restart.txt`).

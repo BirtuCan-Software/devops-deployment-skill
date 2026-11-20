@@ -78,9 +78,16 @@ Configure in *Repository Settings > Environments > [staging | production] > Envi
 | Variable Name | Required For | Staging Example | Production Example | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `CPANEL_USER` | cPanel SSH | `cpaneluser` | `cpaneluser` | Linux account username on the cPanel server. |
-| `CPANEL_APP_DIR` | cPanel (SSH & FTPS) | `staging.yourdomain.com` | `public_html` | Remote folder relative to `/home/user/`. |
+| `CPANEL_APP_DIR` | cPanel (SSH & FTPS) | `staging.yourdomain.com` | `public_html` (or `appapi`) | Backend / Application directory relative to `$HOME/`. |
+| `CPANEL_FRONTEND_DIR` | cPanel (Split Monorepo) | `staging.example.com` | `natran.koshomecafe.com` | Subdomain or document root directory relative to `$HOME/` for built SPA assets. |
 | `CPANEL_FRONTEND_DOMAIN`| Frontend / Fullstack | `https://staging.yourdomain.com` | `https://yourdomain.com` | Public URL for notification cards and summary links. |
 | `CPANEL_API_DOMAIN` | Backend / Hybrid API | `https://api-staging.yourdomain.com` | `https://api.yourdomain.com` | **Omit if UI-only**. Target API endpoint for backend services. |
+
+> [!NOTE]
+> **`CPANEL_FRONTEND_DIR` Scope & Fallback Rule:**
+> - **Scope:** cPanel (SSH & FTPS) for Split Monorepos or separated frontend/backend structures.
+> - **Purpose:** Subdomain or document root directory relative to `$HOME/` where built frontend SPA assets are deployed (e.g. `natran.koshomecafe.com` or `public_html/subdomain`).
+> - **Automatic Fallback Rule:** If `CPANEL_FRONTEND_DIR` is not explicitly set, the deployment script automatically derives it by stripping `https://`, `http://`, trailing slashes, and ports from `CPANEL_FRONTEND_DOMAIN` (e.g. `https://natran.koshomecafe.com/` -> `natran.koshomecafe.com`).
 
 > [!TIP]
 > **Environment Flexibility:**

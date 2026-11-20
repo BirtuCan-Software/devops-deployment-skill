@@ -171,13 +171,15 @@ jobs:
           USER: ${{ vars.CPANEL_USER }}
           HOST: ${{ secrets.CPANEL_SSH_HOST }}
           APP_DIR: ${{ vars.CPANEL_APP_DIR }}
+          FRONTEND_DIR: ${{ vars.CPANEL_FRONTEND_DIR }}
+          FRONTEND_DOMAIN: ${{ vars.CPANEL_FRONTEND_DOMAIN }}
           ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
           RELEASE_ID: ${{ github.sha }}
         run: |
           # If companion deployment script exists in repo, upload and execute it
           if [ -f "./scripts/cpanel-deploy-remote.sh" ]; then
             scp -i "$KEY_PATH" -P "$PORT" -o BatchMode=yes ./scripts/cpanel-deploy-remote.sh "$USER@$HOST:~/$APP_DIR/deploy-remote.sh"
-            ssh -i "$KEY_PATH" -p "$PORT" -o BatchMode=yes "$USER@$HOST" "chmod 700 ~/$APP_DIR/deploy-remote.sh && ~/$APP_DIR/deploy-remote.sh '$APP_DIR' '$ARCHIVE_NAME' '$RELEASE_ID' && rm -f ~/$APP_DIR/deploy-remote.sh"
+            ssh -i "$KEY_PATH" -p "$PORT" -o BatchMode=yes "$USER@$HOST" "chmod 700 ~/$APP_DIR/deploy-remote.sh && FRONTEND_DIR='$FRONTEND_DIR' FRONTEND_DOMAIN='$FRONTEND_DOMAIN' ~/$APP_DIR/deploy-remote.sh '$APP_DIR' '$ARCHIVE_NAME' '$RELEASE_ID' '$FRONTEND_DIR' '$FRONTEND_DOMAIN' && rm -f ~/$APP_DIR/deploy-remote.sh"
           else
             # Idempotent inline extraction fallback (Zero-Clutter Mode)
             ssh -i "$KEY_PATH" -p "$PORT" -o BatchMode=yes "$USER@$HOST" "
@@ -193,7 +195,48 @@ jobs:
               [ -f \$TARGET/shared/.env ] && cp -p \$TARGET/shared/.env \$TARGET/.env || true
               find \$TARGET -type d -exec chmod 755 {} + 2>/dev/null || true
               find \$TARGET -type f -exec chmod 644 {} + 2>/dev/null || true
+
+              # Discover and activate Python virtual environment if present
+              if [ -f \"\$TARGET/manage.py\" ] || [ -f \"\$TARGET/passenger_wsgi.py\" ] || [ -f \"\$TARGET/requirements.txt\" ]; then
+                VENV_ACTIVATE=\$(find \$HOME/virtualenv/$APP_DIR -maxdepth 4 -name activate 2>/dev/null | head -n 1 || true)
+                if [ -z \"\$VENV_ACTIVATE\" ]; then
+                  VENV_ACTIVATE=\$(find \$HOME/virtualenv -maxdepth 5 -name activate 2>/dev/null | grep -i \"$APP_DIR\" | head -n 1 || true)
+                fi
+                if [ -n \"\$VENV_ACTIVATE\" ] && [ -f \"\$VENV_ACTIVATE\" ]; then
+                  source \"\$VENV_ACTIVATE\"
+                  [ -f \"\$TARGET/requirements.txt\" ] && pip install -r \"\$TARGET/requirements.txt\" || true
+                  [ -f \"\$TARGET/manage.py\" ] && python \"\$TARGET/manage.py\" migrate --noinput || true
+                  [ -f \"\$TARGET/manage.py\" ] && python \"\$TARGET/manage.py\" collectstatic --noinput || true
+                fi
+              fi
+
               touch \$TARGET/tmp/restart.txt
+
+              # Resolve and deploy Split Monorepo frontend SPA assets if configured
+              RESOLVED_FRONTEND_DIR=\"${FRONTEND_DIR}\"
+              if [ -z \"\$RESOLVED_FRONTEND_DIR\" ] && [ -n \"${FRONTEND_DOMAIN}\" ]; then
+                RESOLVED_FRONTEND_DIR=\$(echo \"${FRONTEND_DOMAIN}\" | sed -e 's|^https\?://||' -e 's|:[0-9]\+||' -e 's|/*$||')
+              fi
+
+              if [ -n \"\$RESOLVED_FRONTEND_DIR\" ]; then
+                FRONTEND_TARGET=\$HOME/\$RESOLVED_FRONTEND_DIR
+                FRONTEND_SRC=\"\"
+                if [ -d \"\$TARGET/core/static\" ]; then
+                  FRONTEND_SRC=\"\$TARGET/core/static\"
+                elif [ -d \"\$TARGET/dist\" ]; then
+                  FRONTEND_SRC=\"\$TARGET/dist\"
+                fi
+
+                if [ -n \"\$FRONTEND_SRC\" ]; then
+                  mkdir -p \"\$FRONTEND_TARGET\"
+                  cp -rf \"\$FRONTEND_SRC/\"* \"\$FRONTEND_TARGET/\" 2>/dev/null || true
+                  [ -f \"\$FRONTEND_SRC/.htaccess\" ] && cp -f \"\$FRONTEND_SRC/.htaccess\" \"\$FRONTEND_TARGET/.htaccess\" 2>/dev/null || true
+                  [ ! -e \"\$FRONTEND_TARGET/static\" ] && ln -s . \"\$FRONTEND_TARGET/static\" 2>/dev/null || true
+                  find \"\$FRONTEND_TARGET\" -type d -exec chmod 755 {} + 2>/dev/null || true
+                  find \"\$FRONTEND_TARGET\" -type f -exec chmod 644 {} + 2>/dev/null || true
+                fi
+              fi
+
               rm -f \$TARGET/incoming/$ARCHIVE_NAME
             "
           fi

@@ -81,7 +81,7 @@ Whenever more than one deployment target exists, or when external hosting capabi
          ├──► 3. Monorepo (frontend/ + backend/)
          │         └──► [QUESTION 1: Target]
          │                   ├── Option 1: Hybrid (Frontend to Vercel, Backend to cPanel SSH)
-         │                   └── Option 2: Unified (All services on cPanel SSH)
+         │                   └── Option 2: Split / Unified cPanel (Both services to cPanel SSH)
          │
          └──► Common Final Question (All Targets)
                    └──► [QUESTION 2: Telegram Alerts]

@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added POSIX `cp -rn` and `find` fallbacks when `rsync` is disabled inside restricted CloudLinux jailshell environments.
 - **Context Window Optimization:**
   - Streamlined `SKILL.md` by ~35% via strict progressive disclosure, delegating verbose static tables to `references/security-and-secrets.md` and `references/troubleshooting-manual.md`.
+- **Split Monorepo Deployments on cPanel:**
+  - Added native support for dual-target split monorepos on cPanel: frontend SPA deploys to subdomain document root (`CPANEL_FRONTEND_DIR` or derived from `CPANEL_FRONTEND_DOMAIN`) with `base: "/"` and `.htaccess` routing, while backend API deploys to Python/Passenger application root (`$HOME/$CPANEL_APP_DIR`).
+  - Added compatibility symlink (`static -> .`) to prevent static asset 404s.
+- **cPanel Python Virtualenv Discovery:**
+  - Increased virtualenv search depth from 2 to 4 (`-maxdepth 4` with fallback `-maxdepth 5`) to accurately discover CloudLinux/CageFS standard paths (`$HOME/virtualenv/<app_dir>/<python_ver>/bin/activate`).
 
 ---
 

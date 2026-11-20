@@ -12,7 +12,15 @@ The agent must inspect the repository root and first-level subdirectories to cla
 | :--- | :--- | :--- |
 | **Static Frontend / SPA** | Contains UI frameworks (`react`, `vue`, `svelte`, `vite`, `astro`, `next` with static export) with no persistent server runtime. | **cPanel via SSH**, **Vercel**, or **cPanel via FTPS** |
 | **Backend API / Full-Stack** | Contains server runtimes (Node.js/Express/Nest, Python/Django/FastAPI, PHP/Laravel, Go) requiring persistent process or CGI/FastCGI/Passenger execution. | **cPanel via SSH** (FTP cannot run migrations, install packages, or manage processes) |
-| **Monorepo / Multi-Service** | Contains multiple distinct service folders (e.g. `client/` & `server/`, `frontend/` & `backend/`, or workspace manifests like `pnpm-workspace.yaml`, `turbo.json`). | **Hybrid Target** (e.g., Frontend to Vercel, Backend to cPanel SSH) or **Full Monorepo to cPanel SSH** |
+| **Monorepo / Multi-Service (Hybrid)** | Contains frontend (`ui/`, `frontend/`, `client/`) & backend (`api/`, `backend/`, `server/`). | **Hybrid Target** (Frontend to Vercel, Backend to cPanel SSH) |
+| **Monorepo / Split cPanel Targets** | Contains both frontend (`ui/`, `frontend/`, `client/`) & backend (`api/`, `backend/`, `server/`), and cPanel is chosen as the target for both. | **Split cPanel SSH** (SPA on Subdomain Web Root + Backend API on Python/Passenger) |
+
+### Monorepo / Split cPanel Targets Topology
+- **Criteria:** Repository contains both a frontend directory (`ui/`, `frontend/`, `client/`) and a backend directory (`api/`, `backend/`, `server/`), and cPanel is chosen as the target for both.
+- **Architectural Rules:**
+  1. **Frontend SPA:** Must build with `base: "/"` (not `"/static/"`) and deploy its static artifacts (`index.html`, `assets/`, `.htaccess`) directly into the frontend document root (`$HOME/$CPANEL_FRONTEND_DIR` or derived from `$CPANEL_FRONTEND_DOMAIN`).
+  2. **Backend API:** Deploys to the Python Application Root (`$HOME/$CPANEL_APP_DIR`) with automatic cPanel CloudLinux virtualenv discovery/activation, dependency installation, database migrations, and Passenger worker recycling (`touch tmp/restart.txt`).
+  3. **Isolation:** The frontend document root and backend application directory must be strictly isolated to prevent web server routing conflicts.
 
 ---
 

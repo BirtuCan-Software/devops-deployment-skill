@@ -126,9 +126,9 @@ flowchart TD
     Q_FS -->|Other Provider| Blocked_FS["⚠️ Pause for user to provide alternative VPS/PaaS target"]
 
     %% Branch 3: Monorepo
-    Architecture -->|Monorepo: frontend/ + backend/| Q_Mono{"[QUESTION 1: Target Hosting]<br/>Detected monorepo structure.<br/>- Option 1: Hybrid (Frontend to Vercel, Backend to cPanel SSH)<br/>- Option 2: Unified (Both Frontend and Backend to cPanel SSH)"}
+    Architecture -->|Monorepo: frontend/ + backend/| Q_Mono{"[QUESTION 1: Target Hosting]<br/>Detected monorepo structure.<br/>- Option 1: Hybrid (Frontend to Vercel, Backend to cPanel SSH)<br/>- Option 2: Split / Unified cPanel (Both to cPanel SSH)"}
     Q_Mono -->|Hybrid Target| T_Hybrid["Target: Hybrid Pipeline"]
-    Q_Mono -->|Unified Target| T_cPanel_FS
+    Q_Mono -->|cPanel Target| T_cPanel_FS
 
     %% Common Single Downstream Question
     T_Vercel --> Q_TG
@@ -175,7 +175,14 @@ The agent outputs its inspection findings and immediately presents the applicabl
   > **Question 1 (Target Hosting):**
   > "This repository contains both frontend and backend services. How would you like to deploy them?
   > - **[Option 1] Hybrid Deployment (Recommended)**: Deploy the frontend UI to Vercel and the backend API to cPanel via SSH.
-  > - **[Option 2] Unified cPanel Deployment**: Deploy both frontend and backend to cPanel via SSH."
+  > - **[Option 2] Split Monorepo on cPanel (Dual Target)**: Deploy both services to cPanel via SSH into distinct target directories (Frontend SPA to subdomain document root, Backend API to Python/Passenger application root).
+  > - **[Option 3] Unified cPanel Deployment**: Deploy both frontend and backend into a single cPanel application root."
+
+> [!IMPORTANT]
+> **Mandatory Check for Split cPanel Monorepos:**
+> When inspecting a monorepo deploying both services to cPanel, the agent MUST explicitly confirm both:
+> 1. **Backend Application Root (`CPANEL_APP_DIR`, e.g. `~/natranapi`)**: Directory relative to `$HOME/` hosting the backend code, Python virtualenv, and Passenger entrypoint.
+> 2. **Frontend Subdomain Document Root (`CPANEL_FRONTEND_DIR`, e.g. `~/natran.koshomecafe.com`)**: Directory relative to `$HOME/` hosting the built SPA assets (`index.html`, `assets/`, `.htaccess`). If omitted, it automatically falls back to the domain parsed from `CPANEL_FRONTEND_DOMAIN`.
 
 #### 3. Question 2 (Telegram Deployment Alerts — for All Targets):
 > **Question 2 (Telegram Notifications):**
@@ -300,7 +307,8 @@ Consult [security-and-secrets.md#a-repository-secrets-reference-matrix](file:///
 ### 3. Tailored GitHub Environment Variables Table
 Consult [security-and-secrets.md#b-environment-variables-vars-configuration](file:///references/security-and-secrets.md) and render the environment variables table for `staging` and `production`:
 - `CPANEL_USER` (cPanel SSH Linux account name).
-- `CPANEL_APP_DIR` (destination folder relative to `/home/user/`, e.g., `staging.example.com` vs `public_html`).
+- `CPANEL_APP_DIR` (backend / app destination folder relative to `$HOME/`, e.g., `natranapi` or `public_html`).
+- `CPANEL_FRONTEND_DIR` (frontend subdomain document root for split monorepos, e.g. `natran.koshomecafe.com`).
 - `CPANEL_FRONTEND_DOMAIN` (public domain for deployed UI).
 - `CPANEL_API_DOMAIN` (target API endpoint — **omit if UI-only**).
 

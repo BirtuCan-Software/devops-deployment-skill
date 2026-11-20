@@ -11,6 +11,14 @@ set -euo pipefail
 APP_DIR="${1:-public_html}"
 ARCHIVE_NAME="${2:-}"
 RELEASE_ID="${3:-$(date +%Y%m%d%H%M%S)}"
+FRONTEND_DIR="${4:-${FRONTEND_DIR:-}}"
+FRONTEND_DOMAIN="${5:-${FRONTEND_DOMAIN:-}}"
+
+# Resolve Frontend Target Directory (for Split Monorepos on cPanel)
+RESOLVED_FRONTEND_DIR="${FRONTEND_DIR:-}"
+if [ -z "$RESOLVED_FRONTEND_DIR" ] && [ -n "${FRONTEND_DOMAIN:-}" ]; then
+  RESOLVED_FRONTEND_DIR=$(echo "$FRONTEND_DOMAIN" | sed -e 's|^https\?://||' -e 's|:[0-9]\+||' -e 's|/*$||')
+fi
 
 TARGET_PATH="$HOME/$APP_DIR"
 INCOMING_DIR="$TARGET_PATH/incoming"
@@ -107,6 +115,29 @@ fi
 # 5. Run Framework Tasks (Migrations, Cache, Dependencies)
 cd "$NEW_RELEASE"
 
+# Python on cPanel (Django, FastAPI, Flask via Passenger)
+if [ -f "$NEW_RELEASE/manage.py" ] || [ -f "$NEW_RELEASE/passenger_wsgi.py" ] || [ -f "$NEW_RELEASE/requirements.txt" ]; then
+  echo "🐍 Discovering cPanel Python virtual environment..."
+  VENV_ACTIVATE=$(find $HOME/virtualenv/$APP_DIR -maxdepth 4 -name activate 2>/dev/null | head -n 1 || true)
+  if [ -z "$VENV_ACTIVATE" ]; then
+    VENV_ACTIVATE=$(find $HOME/virtualenv -maxdepth 5 -name activate 2>/dev/null | grep -i "$APP_DIR" | head -n 1 || true)
+  fi
+  if [ -n "$VENV_ACTIVATE" ] && [ -f "$VENV_ACTIVATE" ]; then
+    echo "  -> Activating virtualenv: $VENV_ACTIVATE"
+    # shellcheck source=/dev/null
+    source "$VENV_ACTIVATE"
+    if [ -f "$NEW_RELEASE/requirements.txt" ]; then
+      pip install -r "$NEW_RELEASE/requirements.txt" || true
+    fi
+    if [ -f "$NEW_RELEASE/manage.py" ]; then
+      python manage.py migrate --noinput || true
+      python manage.py collectstatic --noinput || true
+    fi
+  else
+    echo "  ⚠️ No virtualenv found for $APP_DIR. Skipping virtualenv activation."
+  fi
+fi
+
 # PHP / Composer / Laravel
 if [ -f "$NEW_RELEASE/artisan" ]; then
   echo "🐘 Executing Laravel post-deploy routines..."
@@ -140,6 +171,32 @@ else
   cp -rn "$TARGET_PATH/"* "$BACKUP_DIR/" 2>/dev/null || true
   cp -rf "$NEW_RELEASE/"* "$TARGET_PATH/" 2>/dev/null || true
   [ -f "$NEW_RELEASE/.htaccess" ] && cp -f "$NEW_RELEASE/.htaccess" "$TARGET_PATH/.htaccess" 2>/dev/null || true
+fi
+
+# 6.5. Deploy Split Frontend SPA Assets (if configured)
+if [ -n "$RESOLVED_FRONTEND_DIR" ]; then
+  FRONTEND_SOURCE=""
+  if [ -d "$NEW_RELEASE/core/static" ] && [ -f "$NEW_RELEASE/core/static/index.html" ]; then
+    FRONTEND_SOURCE="$NEW_RELEASE/core/static"
+  elif [ -d "$NEW_RELEASE/dist" ] && [ -f "$NEW_RELEASE/dist/index.html" ]; then
+    FRONTEND_SOURCE="$NEW_RELEASE/dist"
+  elif [ -d "$NEW_RELEASE/core/static" ]; then
+    FRONTEND_SOURCE="$NEW_RELEASE/core/static"
+  elif [ -d "$NEW_RELEASE/dist" ]; then
+    FRONTEND_SOURCE="$NEW_RELEASE/dist"
+  fi
+
+  if [ -n "$FRONTEND_SOURCE" ]; then
+    FRONTEND_TARGET="$HOME/$RESOLVED_FRONTEND_DIR"
+    echo "🌐 Deploying split frontend SPA assets to: $FRONTEND_TARGET..."
+    mkdir -p "$FRONTEND_TARGET"
+    cp -rf "$FRONTEND_SOURCE/"* "$FRONTEND_TARGET/" 2>/dev/null || true
+    [ -f "$FRONTEND_SOURCE/.htaccess" ] && cp -f "$FRONTEND_SOURCE/.htaccess" "$FRONTEND_TARGET/.htaccess" 2>/dev/null || true
+    [ ! -e "$FRONTEND_TARGET/static" ] && ln -s . "$FRONTEND_TARGET/static" 2>/dev/null || true
+    find "$FRONTEND_TARGET" -type d -exec chmod 755 {} + 2>/dev/null || true
+    find "$FRONTEND_TARGET" -type f -exec chmod 644 {} + 2>/dev/null || true
+    echo "  -> Frontend SPA successfully deployed to $FRONTEND_TARGET."
+  fi
 fi
 
 # 7. Recycle LiteSpeed / Passenger Workers
