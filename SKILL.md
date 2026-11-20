@@ -47,6 +47,7 @@ devops-deployment/
     │   └── deploy-hybrid-monorepo.yml# Monorepo (Vercel UI + cPanel Backend)
     └── configs/
         ├── htaccess-spa.txt          # Production Apache/LiteSpeed SPA rewrite template
+        ├── passenger-wsgi-template.py# Hardened cPanel/Passenger WSGI auto-discovery bridge
         └── vercel-spa.json           # Production Vercel SPA rewrite configuration
 ```
 
@@ -247,6 +248,8 @@ Select the matching baseline template from `assets/workflows/`:
    - Execute deployment: either run [cpanel-deploy-remote.sh](file:///scripts/cpanel-deploy-remote.sh) or execute inline atomic sync commands.
    - Jailshell fallbacks: use Python `zipfile` fallback if `unzip` is missing, and `cp -rn` / `cp -rf` fallback if `rsync` is missing.
    - Ensure runtime state preservation: strictly exclude `.env`, SQLite databases (`*.db`, `*.sqlite*`), `uploads/`, `media/`, `storage/` from being overwritten.
+   - Python/Django/FastAPI cPanel lifecycle: dynamically discover and activate CloudLinux virtualenvs (search depth 4/5), run `pip install -r requirements.txt --no-warn-script-location`, execute `python manage.py migrate --noinput`, and `collectstatic --noinput`.
+   - Python Passenger bridge: ensure `passenger_wsgi.py` contains the hardened virtualenv discovery bridge ([passenger-wsgi-template.py](file:///assets/configs/passenger-wsgi-template.py)) using `site.addsitedir()` for all `site-packages` paths to prevent `ModuleNotFoundError` and disguised "CORS" 500 crashes.
    - Enforce file permissions: `755` for directories, `644` for files.
    - Recycle worker processes: `touch tmp/restart.txt` for LiteSpeed/Passenger.
    - Ensure SPA URL rewriting exists in `.htaccess` if serving client-side routing ([htaccess-spa.txt](file:///assets/configs/htaccess-spa.txt)).

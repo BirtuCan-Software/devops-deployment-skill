@@ -117,23 +117,92 @@ A naive deployment copies files directly over the live directory while web traff
 ## 5. Technology-Specific cPanel Configurations
 
 ### A. Python / Django / FastAPI via Phusion Passenger
-1. **WSGI Entrypoint:**
-   cPanel's *Setup Python App* generates a `passenger_wsgi.py` in the application directory.
-   Ensure the WSGI entrypoint correctly bridges your application:
-   ```python
-   # Example passenger_wsgi.py for Django
-   import os
-   import sys
-   from <project_name>.wsgi import application
-   sys.path.insert(0, os.path.dirname(__file__))
-   ```
-2. **Database Driver Workaround (`pymysql`):**
-   Standard `mysqlclient` requires compiling C extensions during `pip install`, which fails on shared hosting due to missing `mysql_config` headers.
-   Add `pymysql` to your dependencies and insert this into your `settings.py` or `passenger_wsgi.py`:
-   ```python
-   import pymysql
-   pymysql.install_as_MySQLdb()
-   ```
+
+#### 1. CloudLinux Python Selector & Passenger Architecture
+On cPanel servers using CloudLinux Python Selector or LiteSpeed Phusion Passenger:
+- **Isolated Virtual Environments:** When creating an application via cPanel's *Setup Python App*, the virtual environment is provisioned at:
+  ```
+  $HOME/virtualenv/<app_dir>/<python_version>/
+  ```
+  Installed packages reside inside `lib/pythonX.X/site-packages/` and `lib64/pythonX.X/site-packages/`.
+- **The Global Python Trap:** Phusion Passenger spawns application worker processes using the host's base Python interpreter. If `passenger_wsgi.py` directly executes `from myapp.wsgi import application`, Python attempts to import packages from global site-packages, failing with `ModuleNotFoundError: No module named 'django'` (or `pymysql`, `rest_framework`, etc.).
+- **The Requirement for `site.addsitedir()`:**
+  Adding paths via `sys.path.append()` is insufficient because it does not process `.pth` files or configure package namespaces. Using `site.addsitedir()` ensures all installed dependencies, namespace packages, and compiled wheels in `lib/` and `lib64/` are fully registered.
+- **Working Directory Enforcement (`os.chdir`):**
+  Passenger worker processes may run with the current working directory set to `$HOME` or `/`. Forcing `os.chdir(APP_ROOT)` ensures configuration loaders like `python-decouple`, `django-environ`, and `dotenv` locate the `.env` file reliably.
+- **The Disguised "CORS Error" Phenomenon:**
+  When Passenger crashes during WSGI bootstrap, it aborts before Django's `CorsMiddleware` can process the request. LiteSpeed Web Server intercepts the crash and serves a static 500 HTML error page with no `Access-Control-Allow-Origin` headers. Modern browsers block the response with a misleading CORS error. Always check `stderr.log` before troubleshooting CORS headers.
+
+#### 2. Hardened `passenger_wsgi.py` Bridge
+Deployments should utilize the enterprise virtualenv bridge (`assets/configs/passenger-wsgi-template.py`):
+```python
+import os, sys, glob, site
+from pathlib import Path
+
+# Enforce working directory and sys.path
+APP_ROOT = Path(__file__).resolve().parent
+os.chdir(str(APP_ROOT))
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
+
+# Dynamically locate CloudLinux / cPanel virtualenv
+home = Path.home()
+target_venv = None
+venv_root = home / "virtualenv"
+if venv_root.is_dir():
+    for candidate in list(venv_root.glob(f"{APP_ROOT.name}/*")) + list(venv_root.glob("*/*")):
+        if (candidate / "bin" / "activate").is_file():
+            target_venv = candidate
+            break
+
+# Fallback: check in-project virtualenvs (.venv, venv, env)
+if not target_venv:
+    for folder in [".venv", "venv", "env"]:
+        candidate = APP_ROOT / folder
+        if (candidate / "bin" / "activate").is_file():
+            target_venv = candidate
+            break
+
+# Register virtualenv site-packages with site.addsitedir
+if target_venv:
+    for sp in glob.glob(str(target_venv / "lib*" / "python*" / "site-packages")):
+        if os.path.isdir(sp):
+            site.addsitedir(sp)
+    vbin = str(target_venv / "bin")
+    if vbin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = f"{vbin}:{os.environ.get('PATH', '')}"
+
+# Pure-Python MySQL bridge for shared hosting
+try:
+    import pymysql
+    pymysql.install_as_MySQLdb()
+except ImportError:
+    pass
+
+# Export WSGI application
+from backend_config.wsgi import application
+```
+
+#### 3. Database Driver Workaround (`pymysql`)
+Standard `mysqlclient` requires compiling C extensions during `pip install`, which fails on shared hosting due to missing `mysql_config` headers.
+Add `pymysql` to `requirements.txt` and ensure `pymysql.install_as_MySQLdb()` is executed before Django initializes.
+
+#### 4. Automated Python Lifecycle Tasks
+During remote SSH deployment, the deployment script executes:
+```bash
+# 1. Discover and activate virtual environment (search depth 4/5)
+source $VENV_ACTIVATE
+
+# 2. Install dependencies without script path warnings
+pip install -r requirements.txt --no-warn-script-location
+
+# 3. Execute Django migrations and collect static assets
+python manage.py migrate --noinput
+python manage.py collectstatic --noinput
+
+# 4. Trigger Passenger worker pool reload
+touch tmp/restart.txt
+```
 
 ### B. PHP / Laravel Applications
 1. **Document Root Alignment:**

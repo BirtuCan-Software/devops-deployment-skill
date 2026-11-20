@@ -90,13 +90,20 @@ jobs:
           
           # If backend or fullstack: package needed files, excluding source clutter and venvs
           # If static frontend: zip the build directory (e.g. dist/* or build/*)
-          if [ -d "dist" ]; then
+          if [ -d "dist" ] && [ ! -f "manage.py" ] && [ ! -f "passenger_wsgi.py" ]; then
             # Copy SPA .htaccess if serving a client-side SPA
             if [ -f "./assets/configs/htaccess-spa.txt" ] && [ ! -f "dist/.htaccess" ]; then
               cp ./assets/configs/htaccess-spa.txt dist/.htaccess
             fi
             cd dist && zip -q -r "../$ARCHIVE_NAME" . && cd ..
           else
+            # Ensure hardened passenger_wsgi.py is present for Python projects if missing
+            if { [ -f "manage.py" ] || [ -f "wsgi.py" ] || [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; } && [ ! -f "passenger_wsgi.py" ]; then
+              if [ -f "./assets/configs/passenger-wsgi-template.py" ]; then
+                echo "Injecting hardened passenger_wsgi.py template..."
+                cp ./assets/configs/passenger-wsgi-template.py ./passenger_wsgi.py
+              fi
+            fi
             zip -q -r "$ARCHIVE_NAME" . \
               -x "*.git*" "node_modules/*" ".venv/*" "tests/*" ".github/*" "*.md"
           fi

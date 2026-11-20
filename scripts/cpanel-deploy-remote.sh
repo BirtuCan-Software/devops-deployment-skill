@@ -65,6 +65,13 @@ find "$TARGET_PATH" -maxdepth 2 \( -name "*.db" -o -name "*.sqlite" -o -name "*.
   fi
 done
 
+# Preserve existing passenger_wsgi.py if it already contains virtualenv setup
+if [ -f "$TARGET_PATH/passenger_wsgi.py" ] && [ ! -f "$SHARED_DIR/passenger_wsgi.py" ]; then
+  if grep -q "addsitedir" "$TARGET_PATH/passenger_wsgi.py" || grep -q "discover_virtualenv" "$TARGET_PATH/passenger_wsgi.py"; then
+    cp -p "$TARGET_PATH/passenger_wsgi.py" "$SHARED_DIR/passenger_wsgi.py"
+  fi
+fi
+
 # 2. Extract release into new release directory
 echo "📂 Unpacking release into $NEW_RELEASE..."
 mkdir -p "$NEW_RELEASE"
@@ -99,6 +106,12 @@ for persistent_dir in uploads storage media; do
   fi
 done
 
+# If new release lacks passenger_wsgi.py, restore preserved one if available
+if [ ! -f "$NEW_RELEASE/passenger_wsgi.py" ] && [ -f "$SHARED_DIR/passenger_wsgi.py" ]; then
+  echo "  -> Restoring preserved passenger_wsgi.py from shared state..."
+  cp -p "$SHARED_DIR/passenger_wsgi.py" "$NEW_RELEASE/passenger_wsgi.py"
+fi
+
 # 4. Enforce strict permissions (cPanel suPHP / LSAPI compliance)
 echo "🛡️ Enforcing secure file permissions (dirs 755 / files 644)..."
 find "$NEW_RELEASE" -type d -exec chmod 755 {} +
@@ -116,25 +129,83 @@ fi
 cd "$NEW_RELEASE"
 
 # Python on cPanel (Django, FastAPI, Flask via Passenger)
-if [ -f "$NEW_RELEASE/manage.py" ] || [ -f "$NEW_RELEASE/passenger_wsgi.py" ] || [ -f "$NEW_RELEASE/requirements.txt" ]; then
+if [ -f "$NEW_RELEASE/manage.py" ] || [ -f "$NEW_RELEASE/passenger_wsgi.py" ] || [ -f "$NEW_RELEASE/requirements.txt" ] || [ -f "$NEW_RELEASE/pyproject.toml" ]; then
   echo "🐍 Discovering cPanel Python virtual environment..."
   VENV_ACTIVATE=$(find $HOME/virtualenv/$APP_DIR -maxdepth 4 -name activate 2>/dev/null | head -n 1 || true)
   if [ -z "$VENV_ACTIVATE" ]; then
     VENV_ACTIVATE=$(find $HOME/virtualenv -maxdepth 5 -name activate 2>/dev/null | grep -i "$APP_DIR" | head -n 1 || true)
   fi
+  if [ -z "$VENV_ACTIVATE" ]; then
+    for vname in .venv venv env; do
+      if [ -f "$NEW_RELEASE/$vname/bin/activate" ]; then
+        VENV_ACTIVATE="$NEW_RELEASE/$vname/bin/activate"
+        break
+      fi
+    done
+  fi
+
   if [ -n "$VENV_ACTIVATE" ] && [ -f "$VENV_ACTIVATE" ]; then
     echo "  -> Activating virtualenv: $VENV_ACTIVATE"
     # shellcheck source=/dev/null
     source "$VENV_ACTIVATE"
     if [ -f "$NEW_RELEASE/requirements.txt" ]; then
-      pip install -r "$NEW_RELEASE/requirements.txt" || true
+      pip install -r "$NEW_RELEASE/requirements.txt" --no-warn-script-location || true
+    elif [ -f "$NEW_RELEASE/pyproject.toml" ]; then
+      pip install . --no-warn-script-location || true
     fi
     if [ -f "$NEW_RELEASE/manage.py" ]; then
+      echo "  -> Running database migrations..."
       python manage.py migrate --noinput || true
+      echo "  -> Collecting static assets..."
       python manage.py collectstatic --noinput || true
     fi
   else
     echo "  ⚠️ No virtualenv found for $APP_DIR. Skipping virtualenv activation."
+  fi
+
+  # Ensure passenger_wsgi.py contains virtual environment auto-discovery logic
+  if [ -f "$NEW_RELEASE/passenger_wsgi.py" ]; then
+    if ! grep -q "addsitedir" "$NEW_RELEASE/passenger_wsgi.py" && ! grep -q "discover_virtualenv" "$NEW_RELEASE/passenger_wsgi.py"; then
+      echo "  -> Injecting virtualenv discovery bridge into passenger_wsgi.py..."
+      BRIDGE_FILE=$(mktemp)
+      cat << 'PYEOF' > "$BRIDGE_FILE"
+import os, sys, glob, site
+from pathlib import Path
+_app_root = Path(__file__).resolve().parent
+os.chdir(str(_app_root))
+if str(_app_root) not in sys.path:
+    sys.path.insert(0, str(_app_root))
+_home = Path.home()
+_found_venv = None
+_venv_root = _home / "virtualenv"
+if _venv_root.is_dir():
+    for _c in list(_venv_root.glob(f"{_app_root.name}/*")) + list(_venv_root.glob("*/*")):
+        if (_c / "bin" / "activate").is_file():
+            _found_venv = _c
+            break
+if not _found_venv:
+    for _folder in [".venv", "venv", "env"]:
+        if (_app_root / _folder / "bin" / "activate").is_file():
+            _found_venv = _app_root / _folder
+            break
+if _found_venv:
+    for _sp in glob.glob(str(_found_venv / "lib*" / "python*" / "site-packages")):
+        if os.path.isdir(_sp):
+            site.addsitedir(_sp)
+    _vbin = str(_found_venv / "bin")
+    if _vbin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = f"{_vbin}:{os.environ.get('PATH', '')}"
+try:
+    import pymysql
+    pymysql.install_as_MySQLdb()
+except ImportError:
+    pass
+# --- End of Auto-Injected Virtualenv Bridge ---
+PYEOF
+      cat "$NEW_RELEASE/passenger_wsgi.py" >> "$BRIDGE_FILE"
+      mv "$BRIDGE_FILE" "$NEW_RELEASE/passenger_wsgi.py"
+    fi
+    chmod 755 "$NEW_RELEASE/passenger_wsgi.py"
   fi
 fi
 

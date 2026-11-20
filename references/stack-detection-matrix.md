@@ -63,7 +63,10 @@ The agent must inspect the repository root and first-level subdirectories to cla
   - **Flask:** `flask` in dependencies.
 - **Shared Hosting / cPanel Specifics:**
   - Uses Phusion Passenger with `passenger_wsgi.py`.
-  - Check for MySQL drivers: `mysqlclient` requires compilation and often fails on shared hosts without C headers. Recommend replacing with `pymysql` (`pymysql.install_as_MySQLdb()`).
+  - **Virtualenv Path Registration:** CloudLinux/cPanel virtualenvs reside in isolated directories (`~/virtualenv/<app_dir>/<python_version>/lib/pythonX.X/site-packages`). `passenger_wsgi.py` must register these paths using `site.addsitedir()` (not plain `sys.path.append()`) to process `.pth` files, register `lib/` and `lib64/` packages, and prevent `ModuleNotFoundError`.
+  - **Directory Context:** Must enforce `os.chdir(APP_ROOT)` to reliably load `.env` via `python-decouple`, `django-environ`, or `dotenv`.
+  - **MySQL Drivers:** `mysqlclient` requires compilation and fails on shared hosts without C headers. Use `pymysql` (`pymysql.install_as_MySQLdb()`).
+  - **Hardened Entrypoint Template:** Inject `assets/configs/passenger-wsgi-template.py` for robust, auto-discovering WSGI bootstrapping.
 
 ### C. PHP Runtimes
 - **Manifest Files:** `composer.json`, `composer.lock` -> **Composer** (`composer install --no-dev --optimize-autoloader`)
